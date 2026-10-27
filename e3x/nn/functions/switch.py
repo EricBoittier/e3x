@@ -32,9 +32,50 @@ Float = jaxtyping.Float
 _SMOOTH_SWITCH_SLOPE = math.sqrt(3) / 2
 
 
-def _smooth_switch_exp(x: Float[Array, '...']) -> Float[Array, '...']:
-  """Helper function for smooth_switch and its JVP implementation."""
-  return jnp.exp(_SMOOTH_SWITCH_SLOPE * (1 / x - 1 / (1 - x)))
+def _smooth_switch_safe(
+    x: Float[Array, '...'],
+) -> Tuple[Float[Array, '...'], Float[Array, '...']]:
+  """Helper function for smooth_switch and its JVP implementation.
+
+  Returns the switch value and its derivative. The exponential is written as
+  logistic functions, 1/(1 + exp(a)) = sigmoid(-a) and its derivative with
+  sigmoid(a) * sigmoid(-a), so nothing overflows: exp(a) is infinite in float32
+  for x < 0.0102. Where both are constant in floating point (0 or 1, and 0),
+  they are computed at x = 0.5 and masked, so that derivatives of any order of
+  the unused branch stay finite and can not turn into NaN through `jnp.where`.
+
+  Args:
+    x: Input array, already rescaled to the interval [0, 1].
+
+  Returns:
+    The tuple (value, derivative).
+  """
+  # Mask numerically problematic values.
+  eps = jnp.finfo(x.dtype).epsneg
+  small = x < eps
+  large = x > 1 - eps
+  outside = jnp.logical_or(small, large)
+  safe_x = jnp.where(outside, 0.5, x)
+  a = _SMOOTH_SWITCH_SLOPE * (1 / safe_x - 1 / (1 - safe_x))
+  # Far from the midpoint, the derivative underflows to zero while 1/x**2 can
+  # get large: mask these points too.
+  mask = jnp.logical_or(
+      outside, jax.nn.sigmoid(a) * jax.nn.sigmoid(-a) == 0
+  )
+  safe_x = jnp.where(mask, 0.5, x)
+  a = _SMOOTH_SWITCH_SLOPE * (1 / safe_x - 1 / (1 - safe_x))
+  value = jnp.where(
+      mask, jnp.where(x < 0.5, 0, 1).astype(x.dtype), jax.nn.sigmoid(-a)
+  )
+  derivative = jnp.where(
+      mask,
+      0,
+      _SMOOTH_SWITCH_SLOPE
+      * jax.nn.sigmoid(a)
+      * jax.nn.sigmoid(-a)
+      * (1 / safe_x**2 + 1 / (1 - safe_x) ** 2),
+  )
+  return value, derivative
 
 
 @functools.partial(jax.custom_jvp, nondiff_argnums=(1, 2))
@@ -92,17 +133,8 @@ def smooth_switch(
   if x0 != 0.0 or x1 != 1.0:
     x = (x - x0) / (x1 - x0)
 
-  # Mask numerically problematic values.
-  eps = jnp.finfo(x.dtype).epsneg
-  small = x < eps
-  large = x > 1 - eps
-  safe_x = jnp.where(jnp.logical_or(small, large), 0.5, x)
-
-  return jnp.where(
-      small,
-      0,
-      jnp.where(large, 1, 1 / (1 + _smooth_switch_exp(safe_x))),
-  )
+  value, _ = _smooth_switch_safe(jnp.asarray(x))
+  return value
 
 
 @smooth_switch.defjvp
@@ -121,31 +153,6 @@ def _smooth_switch_jvp_impl(
     x = (x - x0) / (x1 - x0)
     x_dot = x_dot / (x1 - x0)
 
-  # Mask numerically problematic values.
-  eps = jnp.finfo(x.dtype).epsneg
-  small = x < eps
-  large = x > 1 - eps
-  small_or_large = jnp.logical_or(small, large)
-  safe_x = jnp.where(small_or_large, 0.5, x)
-
-  # Compute primal output.
-  exp = _smooth_switch_exp(safe_x)
-  primal_out = jnp.where(
-      small,
-      0,
-      jnp.where(large, 1, 1 / (1 + exp)),
-  )
-
-  # Compute (appropriately masked) tangent output. Without masking, higher order
-  # derivatives can lead to nans, even though they should be zero.
-  primal_out2 = primal_out * primal_out
-  raw_tangent = (  # Raw tangent without masking.
-      -_SMOOTH_SWITCH_SLOPE
-      * (-1 / safe_x**2 - 1 / (1 - safe_x) ** 2)
-      * exp
-      * primal_out2
-  )
-  zero_factors = jnp.logical_or(primal_out2 == 0, exp == 0)
-  mask = jnp.logical_or(small_or_large, zero_factors)
-  tangent_out = jnp.where(mask, 0, raw_tangent) * x_dot
+  primal_out, derivative = _smooth_switch_safe(x)
+  tangent_out = derivative * x_dot
   return primal_out, tangent_out

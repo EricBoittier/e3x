@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import e3x
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 
@@ -60,6 +64,48 @@ def test_smooth_switch_has_nan_safe_derivatives() -> None:
   )
   for y in e3x.ops.evaluate_derivatives(e3x.nn.smooth_switch, x, max_order=4):
     assert jnp.all(jnp.isfinite(y))
+
+
+def test_smooth_switch_has_finite_derivatives_everywhere() -> None:
+  # In float32, exp(√3/2 (1/x - 1/(1-x))) overflows for x < 0.0102: values and
+  # derivatives of any order (forward and reverse mode) must stay finite.
+  x = jnp.concatenate([
+      jnp.linspace(-0.1, 1.1, num=1201, dtype=jnp.float32),
+      jnp.geomspace(1e-7, 0.02, num=200, dtype=jnp.float32),
+      1 - jnp.geomspace(1e-7, 0.02, num=200, dtype=jnp.float32),
+  ])
+  for y in e3x.ops.evaluate_derivatives(e3x.nn.smooth_switch, x, max_order=4):
+    assert jnp.all(jnp.isfinite(y))
+  # Reverse-over-reverse and Hessians through other operations used to give
+  # NaN (inf * 0), e.g. for a distance of 1.05 in a 1-10 switch.
+  f = lambda r: jnp.sum(e3x.nn.smooth_switch(r, x0=1.0, x1=10.0) / r)
+  r = 1.0 + 9.0 * x[::8]
+  assert jnp.all(jnp.isfinite(jax.grad(f)(r)))
+  assert jnp.all(jnp.isfinite(jax.hessian(f)(r)))
+  assert jnp.all(jnp.isfinite(jax.jacrev(jax.grad(f))(r)))
+
+  positions = jnp.asarray([[0.0, 0.0, 0.0], [1.05, 0.0, 0.0], [0.0, 1.5, 0.2]])
+  distances = lambda p: jnp.linalg.norm(
+      p[:, None] - p[None] + jnp.eye(3)[..., None], axis=-1  # no zeros
+  )
+  energy = lambda p: f(distances(p))
+  assert jnp.all(jnp.isfinite(jax.hessian(energy)(positions)))
+
+
+def test_smooth_switch_values_far_from_midpoint() -> None:
+  x = np.geomspace(1e-3, 0.5, num=500, dtype=np.float32)
+  x = np.concatenate([x, 1 - x])
+  # Reference in float64: 1 / (1 + exp(a)) and its derivative, without 1 - s.
+  x64 = x.astype(np.float64)
+  a = math.sqrt(3) / 2 * (1 / x64 - 1 / (1 - x64))
+  with np.errstate(over='ignore'):
+    s, t = 1 / (1 + np.exp(a)), 1 / (1 + np.exp(-a))
+  ds = s * t * math.sqrt(3) / 2 * (1 / x64**2 + 1 / (1 - x64) ** 2)
+  value, grad = e3x.ops.evaluate_derivatives(
+      e3x.nn.smooth_switch, jnp.asarray(x), max_order=1
+  )
+  assert np.allclose(value, s, rtol=1e-5, atol=1e-30)
+  assert np.allclose(grad, ds, rtol=1e-4, atol=1e-30)
 
 
 @pytest.mark.parametrize('x0, x1', [(1.0, 0.0), (0.5, 0.5)])
