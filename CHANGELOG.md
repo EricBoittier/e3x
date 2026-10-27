@@ -23,6 +23,8 @@ To release a new version (e.g. from `1.0.0` -> `2.0.0`):
 
 ## [Unreleased]
 * Added support for matrix irreps
+* Fixed NaN second derivatives of e3x.nn.smooth_switch in float32 (exp overflow
+  for inputs close to x0)
 
 ## [1.0.2] - 2024-04-05
 
